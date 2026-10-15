@@ -674,7 +674,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
+            with self.prof.profile_weight_update():
+                self.weight_updater.update_weights()
             print_memory("after update_weights")
 
         if reconnect_rollout_engines:

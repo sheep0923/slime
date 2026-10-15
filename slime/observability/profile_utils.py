@@ -1,6 +1,7 @@
 import logging
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -9,27 +10,35 @@ from slime.utils import accelerator
 from slime.utils.memory_utils import print_memory
 
 logger = logging.getLogger(__name__)
+_DEFAULT_PROFILE_SCHEDULE = object()
 
 
 class TrainProfiler:
     def __init__(self, args):
         self.args = args
         self._torch_profiler_overall = None
+        self._torch_profiler_overall_running = False
         self._memory_profiler_overall = None
+        self._weight_update_count = 0
 
-        if args.use_pytorch_profiler:
+        profile_target = getattr(args, "profile_target", ("train_overall",))
+        if isinstance(profile_target, str):
+            profile_target = (profile_target,)
+
+        if args.use_pytorch_profiler and "train_overall" in profile_target:
             self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
 
-        if args.record_memory_history:
+        if args.record_memory_history and "train_overall" in profile_target:
             self._memory_profiler_overall = _BaseMemoryProfiler.create(args)
             self._memory_profiler_overall.start()
 
     def on_init_end(self):
         if self._torch_profiler_overall is not None:
             self._torch_profiler_overall.start()
+            self._torch_profiler_overall_running = True
 
     def step(self, rollout_id: int):
-        if self._torch_profiler_overall is not None:
+        if self._torch_profiler_overall is not None and self._torch_profiler_overall_running:
             self._torch_profiler_overall.step()
 
         if (
@@ -39,31 +48,88 @@ class TrainProfiler:
         ):
             self._memory_profiler_overall.stop()
 
+    @contextmanager
+    def profile_weight_update(self):
+        """Profile or annotate one weight-update call."""
+        update_id = self._weight_update_count
+        self._weight_update_count += 1
 
-def _create_torch_profiler(args, name):
+        if not _should_profile_weight_update(self.args, update_id):
+            yield
+            return
+
+        # Kineto does not support nested profilers.  Reuse an active overall
+        # profiler and mark the update interval in its trace when available.
+        if self._torch_profiler_overall is not None and self._torch_profiler_overall_running:
+            with torch.profiler.record_function(f"weight_update[{update_id}]"):
+                yield
+            return
+
+        profiler = _create_torch_profiler(
+            self.args,
+            name=f"weight_update_{update_id}",
+            schedule=None,
+        )
+        with profiler:
+            with torch.profiler.record_function(f"weight_update[{update_id}]"):
+                yield
+
+
+def _distributed_rank():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _should_profile_weight_update(args, update_id):
+    profile_target = getattr(args, "profile_target", ())
+    if isinstance(profile_target, str):
+        profile_target = (profile_target,)
+    if not (getattr(args, "use_pytorch_profiler", False) and "weight_update" in profile_target):
+        return False
+
+    start = getattr(args, "weight_update_profile_start", 0)
+    end = getattr(args, "weight_update_profile_end", 1)
+    if not start <= update_id < end:
+        return False
+
+    profile_ranks = getattr(args, "profile_ranks", None)
+    if profile_ranks is None:
+        return True
+    if isinstance(profile_ranks, int):
+        profile_ranks = (profile_ranks,)
+    return not profile_ranks or _distributed_rank() in profile_ranks
+
+
+def _create_torch_profiler(args, name, schedule=_DEFAULT_PROFILE_SCHEDULE):
     activities = [torch.profiler.ProfilerActivity.CPU]
     activity_name = accelerator.device_type().upper()
     if hasattr(torch.profiler.ProfilerActivity, activity_name):
         activities.append(getattr(torch.profiler.ProfilerActivity, activity_name))
 
-    return torch.profiler.profile(
-        activities=activities,
-        schedule=torch.profiler.schedule(
+    profiler_kwargs = {
+        "activities": activities,
+        "on_trace_ready": torch.profiler.tensorboard_trace_handler(
+            args.tensorboard_dir,
+            worker_name=f"{name}_rank_{_distributed_rank()}",
+            use_gzip=True,
+        ),
+        "record_shapes": True,
+        "with_stack": True,
+        "profile_memory": True,
+        "with_flops": True,
+    }
+    if schedule is _DEFAULT_PROFILE_SCHEDULE:
+        profiler_kwargs["schedule"] = torch.profiler.schedule(
             wait=max(args.profile_step_start - 1, 0),
             warmup=1 if args.profile_step_start > 0 else 0,
             active=args.profile_step_end - args.profile_step_start,
             repeat=1,
-        ),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            args.tensorboard_dir,
-            worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
-            use_gzip=True,
-        ),
-        record_shapes=True,
-        with_stack=True,
-        profile_memory=True,
-        with_flops=True,
-    )
+        )
+    elif schedule is not None:
+        profiler_kwargs["schedule"] = schedule
+
+    return torch.profiler.profile(**profiler_kwargs)
 
 
 class _BaseMemoryProfiler:

@@ -1421,6 +1421,35 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
             )
             parser.add_argument(
+                "--profile-target",
+                type=str,
+                choices=["train_overall", "train_actor", "train_log_probs", "weight_update"],
+                default=["train_overall"],
+                nargs="+",
+            )
+            parser.add_argument(
+                "--weight-update-profile-start",
+                "--weight-update-profile-step-start",
+                dest="weight_update_profile_start",
+                type=int,
+                default=0,
+                help=(
+                    "First weight-update call to profile when --profile-target includes weight_update. "
+                    "The initial synchronization is update 0; the range is inclusive at the start."
+                ),
+            )
+            parser.add_argument(
+                "--weight-update-profile-end",
+                "--weight-update-profile-step-end",
+                dest="weight_update_profile_end",
+                type=int,
+                default=1,
+                help=(
+                    "Exclusive end of the weight-update call range to profile when --profile-target includes "
+                    "weight_update."
+                ),
+            )
+            parser.add_argument(
                 "--memory-recorder",
                 type=str,
                 choices=["torch", "memray"],
@@ -2211,6 +2240,14 @@ def slime_validate_args(args):
 
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    profile_start = getattr(args, "weight_update_profile_start", 0)
+    profile_end = getattr(args, "weight_update_profile_end", 1)
+    if profile_start < 0 or profile_end <= profile_start:
+        raise ValueError(
+            "--weight-update-profile-end must be greater than "
+            "--weight-update-profile-start, and the start must be non-negative."
+        )
 
     # disk-backed sync (full or delta) writes on the trainer and reads on the engines: needs a shared dir
     if args.update_weight_transport == "disk" and not args.update_weight_disk_dir:
