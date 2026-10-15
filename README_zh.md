@@ -6,9 +6,14 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/THUDM/slime/pr-test.yml?branch=main&event=push&label=CI&logo=github)](https://github.com/THUDM/slime/actions/workflows/pr-test.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/THUDM/slime)
 
-**slime** 是一个面向大规模强化学习的 LLM 后训练框架，将 Megatron 训练与 SGLang rollout 连接起来，并提供自定义数据生成和奖励接口。
+**slime** 是为 RL scaling 设计的 LLM post‑training 框架，提供两大核心能力：
 
-训练、rollout、数据缓冲区和环境反馈共享同一条数据流，可以在同一套训练循环中接入数学、代码、搜索、工具调用和长程智能体任务。
+1. **高性能训练**：通过连接 Megatron 与 SGLang，支持各种模式的高效训练；
+2. **灵活的数据生成**：通过自定义数据生成接口以及 server-based engine，实现任意训练数据生成流程。
+
+slime 的设计目标，是让这两大能力彼此强化，同时避免把系统变成一组割裂的 trainer、rollout service 和 agent framework。Megatron training、SGLang rollout、custom data generation、reward computation、verifier feedback 和 environment interaction 都流经同一条 training / rollout / Data Buffer 路径。
+
+这让 slime 成为最经受实战验证的开源 RL post-training 框架之一：它足够轻量、清晰、易扩展，同时也经过了 SOTA 级模型发布背后的完整训练闭环验证。
 
 ## 设计特点
 
@@ -19,7 +24,7 @@
 
 ## 支持的模型
 
-除 GLM 系列外，slime 还支持 Qwen（Qwen3.6、Qwen3.5、Qwen3-Next、Qwen3 MoE、Qwen3、Qwen2.5）、DeepSeek（V3、V3.1、R1）和 Llama 3。模型配置见 [scripts/models](scripts/models/)，训练示例见[在线文档](https://thudm.github.io/slime/zh/)。
+除 GLM 系列外，slime 还支持 Qwen（Qwen3.8、Qwen3.6、Qwen3.5、Qwen3-Next、Qwen3 MoE、Qwen3、Qwen2.5）、DeepSeek（V3、V3.1、R1）和 Llama 3。模型配置见 [scripts/models](scripts/models/)，训练示例见[在线文档](https://thudm.github.io/slime/zh/)。
 
 ## 引擎配置与部署
 
@@ -81,7 +86,7 @@ CPU 测试覆盖核心行为和自定义接口约定；GPU 测试覆盖 dense/Mo
 - [`examples/multi_agent`](examples/multi_agent/README.md)：在标准 rollout 循环内通过 `--custom-generate-function-path` 实现多智能体生成。
 - [`examples/search-r1`](examples/search-r1/)：通过 `--custom-generate-function-path` 实现搜索/RAG 风格的多轮生成。
 - [`examples/fully_async`](examples/fully_async/README.md)：全异步 rollout，适合样本生成耗时差异较大的长尾任务。
-- [`examples/coding_agent_rl`](examples/coding_agent_rl/README.md)：端到端代码智能体 RL，包含沙盒工具调用、基于测试的奖励和 token 级训练轨迹。
+- [`examples/coding_agent_rl`](examples/coding_agent_rl/README.md)：使用 Qwen3.8-27B、小米 MiMo SWE 数据和 sunabako 沙盒，运行代码智能体 RL，保留官方测试奖励和 token 级训练轨迹。
 
 如何为智能体工作流选择合适的接口，请参考 [自定义指南](docs/zh/get_started/customization.md)。
 
