@@ -1423,7 +1423,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--profile-target",
                 type=str,
-                choices=["train_overall", "train_actor", "train_log_probs", "weight_update"],
+                choices=["train_overall", "weight_update"],
                 default=["train_overall"],
                 nargs="+",
             )
