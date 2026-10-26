@@ -30,6 +30,7 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.observability import logging_utils, train_metric_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.weight_staleness import collect_sample_weight_staleness
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
@@ -72,6 +73,43 @@ def _wrap_forward_step_with_microbatch_pbar(forward_step_func, pbar):
         return result
 
     return wrapped_forward_step
+
+
+def _reduce_weight_staleness(
+    local_stats: tuple[float, int, int | None, int | None, int],
+    model: Sequence[DDP],
+) -> dict[str, float | int]:
+    """Reduce sample staleness across the DP and CP ranks of each model shard."""
+    local_sum, local_known, local_max, local_min, local_unknown = local_stats
+    try:
+        device = next(model[0].parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+
+    # CP ranks see the same samples. The mean is unchanged; counts need
+    # division by CP size after reduction.
+    totals = torch.tensor([local_sum, local_known, local_unknown], dtype=torch.float64, device=device)
+    dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+    torch.distributed.all_reduce(totals, group=dp_group)
+
+    maximum = torch.tensor(float("-inf") if local_max is None else local_max, dtype=torch.float64, device=device)
+    minimum = torch.tensor(float("inf") if local_min is None else local_min, dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+    torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN, group=dp_group)
+
+    cp_size = mpu.get_context_parallel_world_size()
+    known = int(round(totals[1].item() / cp_size))
+    unknown = int(round(totals[2].item() / cp_size))
+    if known == 0:
+        return {"weight_staleness_known_samples": 0, "weight_staleness_unknown_samples": unknown}
+
+    return {
+        "weight_staleness_mean": totals[0].item() / totals[1].item(),
+        "weight_staleness_max": maximum.item(),
+        "weight_staleness_min": minimum.item(),
+        "weight_staleness_known_samples": known,
+        "weight_staleness_unknown_samples": unknown,
+    }
 
 
 def _with_rollout_top_p_token_keys(args: Namespace, keys: Sequence[str]) -> list[str]:
@@ -729,6 +767,8 @@ def train(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     global_batch_sizes: Sequence[int],
+    sample_weight_versions: Sequence[Sequence[object]] | None = None,
+    current_weight_version: object | None = None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -748,6 +788,8 @@ def train(
             ``num_microbatches``; consumed by ``train_one_step`` for loss
             scaling and LR scheduler increments. Equals per-step sample count
             in the common case (1 rollout = 1 sample).
+        sample_weight_versions: Weight versions for each local rollout sample.
+        current_weight_version: Version of the trainer's rollout-engine snapshot.
     """
     args = get_args()
 
@@ -840,7 +882,20 @@ def train(
     )
 
     # Run training iterations till done.
+    microbatch_offset = 0
     for step_id in range(num_steps_per_rollout):
+
+        weight_staleness = None
+        if sample_weight_versions is not None and current_weight_version is not None:
+            step_microbatches = data_iterator[0].micro_batch_indices[
+                microbatch_offset : microbatch_offset + num_microbatches[step_id]
+            ]
+            step_sample_indices = [index for microbatch in step_microbatches for index in microbatch]
+            local_stats = collect_sample_weight_staleness(
+                sample_weight_versions, step_sample_indices, current_weight_version
+            )
+            weight_staleness = _reduce_weight_staleness(local_stats, model)
+        microbatch_offset += num_microbatches[step_id]
 
         # Run training step.
         loss_dict, grad_norm = train_one_step(
@@ -914,6 +969,12 @@ def train(
 
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
+            if weight_staleness is not None:
+                for key, value in weight_staleness.items():
+                    log_dict[f"train/{role_tag}{key}"] = value
+                if "weight_staleness_mean" in weight_staleness:
+                    log_dict[f"train/{role_tag}weight_staleness"] = weight_staleness["weight_staleness_mean"]
+                log_dict[f"train/{role_tag}weight_version"] = current_weight_version
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")
 

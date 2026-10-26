@@ -175,9 +175,13 @@ def test_dp_transport_keeps_heads_aligned(monkeypatch, transport):
     monkeypatch.setattr(rollout.ray, "put", put)
     data = samples()
     data[1].rollout_topk_token_ids[0] = [5, 6, 7]
+    data[0].weight_versions = ["v3"]
+    data[1].weight_versions = ["v1", "v4"]
     refs = mgr.split_by_dp(mgr.convert(data))
     assert refs[0].inner["rollout_topk_token_ids"][0].tolist() == [[5, 6, 7]]
     assert refs[1].inner["rollout_topk_token_ids"][0].tolist() == [[3, 1, 4]]
+    assert refs[0].inner["weight_versions"] == [["v1", "v4"]]
+    assert refs[1].inner["weight_versions"] == [["v3"]]
     assert captured == ([{"_tensor_transport": "nixl"}] * 2 if transport == "nixl" else [{}, {}])
 
 
@@ -366,12 +370,14 @@ def test_exact_top_p_transport_and_microbatch(monkeypatch, tmp_path, transport):
         )
         if i == 1:
             sample.append_response_tokens(mgr.args, tokens=[8], trainable=False)
+        sample.weight_versions = [f"v{i + 1}"]
         samples.append(sample)
     if transport == "straw":
         samples = pack_rollout_payload(samples, mgr.args, 0).load()
     batch = mgr.convert(samples)
     refs = mgr.split_by_dp(batch)
     shards = [ref.inner.load() if transport == "straw" else ref.inner for ref in refs]
+    assert [shard["weight_versions"] for shard in shards] == [[["v2"]], [["v1"]]]
     offsets = shards[0]["rollout_top_p_token_offsets"][0]
     assert (offsets.load() if isinstance(offsets, TensorRef) else offsets).tolist() == [0, 2, 3, 3]
     for shard in shards:

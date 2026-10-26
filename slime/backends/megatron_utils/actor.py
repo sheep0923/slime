@@ -560,6 +560,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_iterator,
                     num_microbatches,
                     global_batch_sizes,
+                    sample_weight_versions=rollout_data.get("weight_versions"),
+                    current_weight_version=self.weight_updater.weight_version,
                 )
             if capture_log_probs:
                 captured = drain_captured_log_probs()
