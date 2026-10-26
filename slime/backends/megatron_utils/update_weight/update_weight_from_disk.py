@@ -35,6 +35,7 @@ class UpdateWeightFromDisk:
         self.update_weight_metrics: dict[str, float] = {}
         self.rollout_engines: Sequence[ActorHandle] = []
         self.rollout_engine_lock: ActorHandle | None = None
+        self._prepared_version_dir: Path | None = None
         # Post-write hook: object-store-backed shared filesystems lack cross-host
         # read-after-write consistency, so written files need an explicit step
         # (e.g. uploading them to the backing object store) before the engines can see them.
@@ -63,9 +64,11 @@ class UpdateWeightFromDisk:
         return out
 
     @torch.no_grad()
-    def update_weights(self) -> None:
-        self.weight_version += 1
-        version_dir = Path(self.args.update_weight_disk_dir) / f"weight_v{self.weight_version:06d}"
+    def prepare_weights(self) -> None:
+        """Write the next checkpoint while rollout uses old weights."""
+        if self._prepared_version_dir is not None:
+            raise RuntimeError("A disk weight update is already prepared")
+        version_dir = Path(self.args.update_weight_disk_dir) / f"weight_v{self.weight_version + 1:06d}"
 
         if dist.get_rank() == 0:
             shutil.rmtree(version_dir, ignore_errors=True)
@@ -84,12 +87,22 @@ class UpdateWeightFromDisk:
         )
         dist.barrier(group=get_gloo_group())
 
-        # every rank runs the hook (it gates itself): each container must publish
-        # its own writes
-        if self._post_write_hook is not None:
-            self._post_write_hook(self.args, str(version_dir), list(self.rollout_engines))
-        dist.barrier(group=get_gloo_group())
+        self._prepared_version_dir = version_dir
 
+    @torch.no_grad()
+    def update_weights(self) -> None:
         # SGLang reload is orchestrated by RayTrainGroup after the checkpoint
-        # is fully written, so training-side lifecycle can decide whether
-        # Megatron actors are still alive.
+        # is fully written. With overlap, prepare_weights did this during the
+        # preceding train call; startup and ordinary sync still prepare here.
+        if self._prepared_version_dir is None:
+            self.prepare_weights()
+        expected = Path(self.args.update_weight_disk_dir) / f"weight_v{self.weight_version + 1:06d}"
+        if self._prepared_version_dir != expected:
+            raise RuntimeError(f"Prepared disk weight version differs from expected path: {self._prepared_version_dir}")
+        # Recovery can replace rollout engines after prepare_weights. The
+        # publication hook must receive the current engine list at sync time.
+        if self._post_write_hook is not None:
+            self._post_write_hook(self.args, str(expected), list(self.rollout_engines))
+        dist.barrier(group=get_gloo_group())
+        self.weight_version += 1
+        self._prepared_version_dir = None

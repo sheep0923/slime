@@ -439,6 +439,50 @@ def make_slime_validate_args(**overrides):
     return types.SimpleNamespace(**values)
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("transport", ["nccl", "disk"])
+def test_overlap_weight_preparation_accepts_full_weight_sync(monkeypatch, transport):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        overlap_weight_preparation=True,
+        rollout_function_path="slime.rollout.sglang_rollout.generate_rollout",
+        update_weight_transport=transport,
+        update_weight_disk_dir="/shared/weights" if transport == "disk" else None,
+    )
+    validated, _ = module.slime_validate_args(args)
+    assert validated.overlap_weight_preparation
+    assert validated.rollout_function_path == "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
+    assert validated.eval_function_path == "slime.rollout.sglang_rollout.generate_rollout"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"update_weight_mode": "delta", "update_weight_transport": "disk", "update_weight_disk_dir": "/shared"},
+        {"colocate": True},
+        {"offload_train": True},
+        {"offload_rollout": True},
+        {"debug_train_only": True},
+        {"debug_rollout_only": True},
+    ],
+)
+def test_overlap_weight_preparation_rejects_incompatible_modes(monkeypatch, overrides):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(overlap_weight_preparation=True, **overrides)
+    with pytest.raises(ValueError, match="--overlap-weight-preparation requires"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_overlap_weight_preparation_requires_a_background_rollout_producer(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    with pytest.raises(ValueError, match="built-in fully async rollout producer"):
+        module.slime_validate_args(
+            make_slime_validate_args(overlap_weight_preparation=True, rollout_function_path="custom.rollout")
+        )
+
+
 def test_trainer_fault_tolerance_saves_reshardable_optimizer(monkeypatch, tmp_path):
     module = load_slime_arguments_module(monkeypatch)
     args = make_slime_validate_args(

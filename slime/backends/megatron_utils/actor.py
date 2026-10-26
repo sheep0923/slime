@@ -570,6 +570,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 if captured:
                     rollout_data["log_probs"] = [captured[pos] for pos in rollout_data["partition"]]
 
+            if getattr(self.args, "overlap_weight_preparation", False):
+                with timer("prepare_weight_update"):
+                    self.weight_updater.prepare_weights()
+
             self.prof.step(rollout_id=rollout_id)
 
         train_data_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)

@@ -48,6 +48,17 @@ class UpdateWeightFromDistributed:
         self.weight_version = 0
         self._model_update_groups = None
         self.update_weight_metrics: dict[str, float] = {}
+        self._prepared_weight_chunks: list[list[list[tuple[str, torch.Tensor]]]] | None = None
+
+    @torch.no_grad()
+    def prepare_weights(self) -> None:
+        """Gather and convert the next full-weight payload without touching engines."""
+        if self._prepared_weight_chunks is not None:
+            raise RuntimeError("An NCCL weight update is already prepared")
+        self._prepared_weight_chunks = [
+            list(self._iter_non_expert_chunks()),
+            list(self._iter_expert_chunks()),
+        ]
 
     def pop_metrics(self) -> dict[str, float]:
         """
@@ -148,7 +159,12 @@ class UpdateWeightFromDistributed:
         yields broadcast-ready chunks (bucketing happens internally); subclasses
         override ``_on_chunk`` to inject per-chunk behaviour.
         """
-        for chunk_iter in (self._iter_non_expert_chunks(), self._iter_expert_chunks()):
+        prepared = self._prepared_weight_chunks
+        self._prepared_weight_chunks = None
+        chunk_iters = prepared if prepared is not None else (
+            self._iter_non_expert_chunks(), self._iter_expert_chunks()
+        )
+        for chunk_iter in chunk_iters:
             for hf_chunk in chunk_iter:
                 self._on_chunk(hf_chunk)
                 self._update_bucket_weights_from_distributed(hf_chunk, pbar=pbar)

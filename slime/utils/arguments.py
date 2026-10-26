@@ -163,6 +163,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--overlap-weight-preparation",
+                action="store_true",
+                default=False,
+                help=(
+                    "Prepare full NCCL buckets or a shared-disk checkpoint after actor training "
+                    "while the rollout producer continues generating. Rollout engines load the "
+                    "new version only at the normal weight-update boundary."
+                ),
+            )
+            parser.add_argument(
                 "--release-train",
                 action="store_true",
                 default=False,
@@ -2218,6 +2228,19 @@ def slime_validate_args(args):
             "--update-weight-transport=disk requires --update-weight-disk-dir to point at "
             "a filesystem shared between the trainer and the rollout engines."
         )
+    if getattr(args, "overlap_weight_preparation", False) and (
+        args.update_weight_mode != "full"
+        or args.update_weight_transport not in ("nccl", "disk")
+        or args.colocate
+        or args.offload_train
+        or args.offload_rollout
+        or args.debug_train_only
+        or args.debug_rollout_only
+    ):
+        raise ValueError(
+            "--overlap-weight-preparation requires full NCCL or disk weight updates, "
+            "live rollout, separate train/rollout GPUs, and train/rollout offload disabled."
+        )
     if args.release_train:
         if args.use_critic:
             raise ValueError("--release-train does not support critic training yet.")
@@ -2257,6 +2280,18 @@ def slime_validate_args(args):
             args.rollout_function_path = "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
         if args.eval_function_path is None:
             args.eval_function_path = "slime.rollout.sglang_rollout.generate_rollout"
+
+    if getattr(args, "overlap_weight_preparation", False):
+        synchronous_rollout = "slime.rollout.sglang_rollout.generate_rollout"
+        asynchronous_rollout = "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
+        if args.rollout_function_path == synchronous_rollout:
+            args.rollout_function_path = asynchronous_rollout
+        elif args.rollout_function_path != asynchronous_rollout:
+            raise ValueError(
+                "--overlap-weight-preparation requires the built-in fully async rollout producer."
+            )
+        if args.eval_function_path is None or args.eval_function_path == asynchronous_rollout:
+            args.eval_function_path = synchronous_rollout
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
