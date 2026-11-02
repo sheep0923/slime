@@ -165,6 +165,7 @@ def log_rollout_data(
             "loss_masks",
             "sample_indices",
             "rollout_ids",
+            "weight_versions",
             "rollout_mask_sums",
             "rollout_topk_token_ids",
             "rollout_topk_log_probs",
