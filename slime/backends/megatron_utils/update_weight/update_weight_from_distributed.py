@@ -4,6 +4,8 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import nullcontext
+from dataclasses import dataclass
 
 import ray
 import torch
@@ -20,6 +22,13 @@ from slime.utils.weight_sync import should_flush_cache
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
+
+
+@dataclass
+class _PendingWeightUpdate:
+    tensors: list[tuple[str, torch.Tensor]]
+    refs: list[ObjectRef]
+    handles: list[object]
 
 
 class UpdateWeightFromDistributed:
@@ -48,6 +57,7 @@ class UpdateWeightFromDistributed:
         self.weight_version = 0
         self._model_update_groups = None
         self.update_weight_metrics: dict[str, float] = {}
+        self._weight_send_stream = None
 
     def pop_metrics(self) -> dict[str, float]:
         """
@@ -148,10 +158,24 @@ class UpdateWeightFromDistributed:
         yields broadcast-ready chunks (bucketing happens internally); subclasses
         override ``_on_chunk`` to inject per-chunk behaviour.
         """
+        overlap = bool(getattr(self.args, "overlap_update_weight", False))
         for chunk_iter in (self._iter_non_expert_chunks(), self._iter_expert_chunks()):
-            for hf_chunk in chunk_iter:
-                self._on_chunk(hf_chunk)
-                self._update_bucket_weights_from_distributed(hf_chunk, pbar=pbar)
+            pending = None
+            try:
+                for hf_chunk in chunk_iter:
+                    # The iterator prepares n+1 while n is still being sent.
+                    # All ranks retain the same TP/EP collective order.
+                    if pending is not None:
+                        previous, pending = pending, None
+                        self._finish_bucket_weights_from_distributed(previous, pbar=pbar)
+                    self._on_chunk(hf_chunk)
+                    if overlap:
+                        pending = self._start_bucket_weights_from_distributed(hf_chunk)
+                    else:
+                        self._update_bucket_weights_from_distributed(hf_chunk, pbar=pbar)
+            finally:
+                if pending is not None:
+                    self._finish_bucket_weights_from_distributed(pending, pbar=pbar)
             dist.barrier(group=get_gloo_group())
 
     def _on_chunk(self, hf_chunk: list[tuple[str, torch.Tensor]]) -> None:
@@ -273,6 +297,43 @@ class UpdateWeightFromDistributed:
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
 
+    def _start_bucket_weights_from_distributed(
+        self, converted_named_tensors: list[tuple[str, torch.Tensor]]
+    ) -> _PendingWeightUpdate | None:
+        """Start a transfer, retaining its tensors and engine lock until completion."""
+        if not self._is_pp_src_rank:
+            return None
+        while not ray.get(self.rollout_engine_lock.acquire.remote()):
+            time.sleep(0.1)
+        try:
+            if self._weight_send_stream is None:
+                self._weight_send_stream = accelerator.new_stream()
+            refs, handles = update_weights_from_distributed(
+                self._group_name,
+                self._model_update_groups,
+                self.weight_version,
+                self.rollout_engines,
+                converted_named_tensors,
+                wait_for_broadcast=False,
+                broadcast_stream=self._weight_send_stream,
+            )
+        except Exception:
+            ray.get(self.rollout_engine_lock.release.remote())
+            raise
+        return _PendingWeightUpdate(converted_named_tensors, refs, handles)
+
+    def _finish_bucket_weights_from_distributed(self, pending: _PendingWeightUpdate, pbar: tqdm | None = None) -> None:
+        """Wait for device transfer and engine loading before releasing the bucket."""
+        try:
+            for handle in pending.handles:
+                handle.wait()
+            ray.get(pending.refs)
+        finally:
+            pending.tensors.clear()
+            ray.get(self.rollout_engine_lock.release.remote())
+        if pbar is not None:
+            pbar.update(1)
+
 
 def connect_rollout_engines_from_distributed(
     args: Namespace,
@@ -340,7 +401,10 @@ def update_weights_from_distributed(
     rollout_engines: Sequence[ActorHandle],
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
     load_format: str | None = None,
-) -> list[ObjectRef]:
+    *,
+    wait_for_broadcast: bool = True,
+    broadcast_stream: object | None = None,
+) -> list[ObjectRef] | tuple[list[ObjectRef], list[object]]:
     """
     Send metadata through Ray and tensors through the configured transport.
     """
@@ -356,12 +420,17 @@ def update_weights_from_distributed(
         for engine in rollout_engines
     ]
     handles = []
-    for _, param in converted_named_tensors:
-        handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
-    for handle in handles:
-        handle.wait()
-
-    return refs
+    if broadcast_stream is not None:
+        # Make the send stream wait for the gather/conversion producing this bucket.
+        broadcast_stream.wait_stream(accelerator.current_stream())
+    with accelerator.stream(broadcast_stream) if broadcast_stream is not None else nullcontext():
+        for _, param in converted_named_tensors:
+            handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
+    if wait_for_broadcast:
+        for handle in handles:
+            handle.wait()
+        return refs
+    return refs, handles
 
 
 def post_process_weights(

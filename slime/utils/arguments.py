@@ -586,6 +586,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             # update weight
             parser.add_argument(
+                "--overlap-update-weight",
+                action="store_true",
+                default=False,
+                help=(
+                    "Overlap sending the current full NCCL weight chunk with TP/EP gather "
+                    "and HF conversion of the next chunk."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-buffer-size",
                 type=int,
                 default=512 * 1024**2,
@@ -2229,6 +2238,17 @@ def slime_validate_args(args):
 
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if getattr(args, "overlap_update_weight", False) and (
+        args.update_weight_mode != "full"
+        or args.update_weight_transport != "nccl"
+        or args.colocate
+        or args.offload_train
+    ):
+        raise ValueError(
+            "--overlap-update-weight requires full NCCL transport, separate train/rollout GPUs, "
+            "and --offload-train disabled."
+        )
 
     # disk-backed sync (full or delta) writes on the trainer and reads on the engines: needs a shared dir
     if args.update_weight_transport == "disk" and not args.update_weight_disk_dir:
